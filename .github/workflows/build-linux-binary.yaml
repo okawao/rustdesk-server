@@ -1,0 +1,80 @@
+name: build-linux-binary
+
+# A deployable hbbs/hbbr for a self-hosted linux server. The release workflow's matrix cannot be
+# used for that: it cross-builds with `cross` 0.2.5, whose image has no OpenSSL, and hbb_common
+# enables native-tls unconditionally.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-linux-binary.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  gnu:
+    name: linux gnu
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --all-features
+
+      - name: Publish Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-linux-gnu
+          path: |
+            target/release/hbbs
+            target/release/hbbr
+
+  static:
+    name: linux static
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools pkg-config
+
+      # OpenSSL is built from source for musl (the `vendored` feature), so musl-gcc has to be the
+      # compiler that sees it. The link itself is left to rustc's own musl support, which is what
+      # produces a binary with no interpreter at all; Ubuntu's musl-gcc would link against the
+      # shared musl, and the server this is for has none.
+      - name: Build
+        continue-on-error: true
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CXX_x86_64_unknown_linux_musl: musl-g++
+          AR_x86_64_unknown_linux_musl: ar
+          OPENSSL_STATIC: "1"
+        run: cargo build --release --all-features --target x86_64-unknown-linux-musl
+
+      - name: Publish Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-linux-static
+          if-no-files-found: warn
+          path: |
+            target/x86_64-unknown-linux-musl/release/hbbs
+            target/x86_64-unknown-linux-musl/release/hbbr
