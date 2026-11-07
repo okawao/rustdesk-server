@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::kx::StreamCipher;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -51,7 +52,7 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<StreamCipher>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -212,6 +213,13 @@ impl RendezvousServer {
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
+        if rs.inner.sk.is_none() {
+            log::warn!(
+                "key exchange is off: no ed25519 secret key, so clients that register over TCP \
+                 (disable-udp) cannot connect. Run hbbs with -k <secret key>, or with -k - to \
+                 generate id_ed25519."
+            );
+        }
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(bind_addr, port).await?;
@@ -918,8 +926,8 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                    Sink::TcpStream(s, cipher) => {
+                        allow_err!(s.send(Bytes::from(crate::kx::seal(cipher, bytes))).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
@@ -1298,9 +1306,41 @@ impl RendezvousServer {
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
-            let (a, mut b) = framed.split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (mut a, mut b) = framed.split();
+            // A client that registers over TCP waits for this opening message before sending
+            // anything of its own, so it has to go out before the read loop starts.
+            let exchange = match self.inner.sk.as_ref() {
+                Some(sk) => crate::kx::exchange(&mut a, &mut b, sk).await,
+                None => Ok(crate::kx::KeyExchangeResult::plain()),
+            };
+            let crate::kx::KeyExchangeResult {
+                cipher,
+                first_message,
+            } = match exchange {
+                Ok(res) => res,
+                Err(err) => {
+                    // The peer did take part and the exchange failed, so it goes on encrypting.
+                    // The connection cannot continue in the clear.
+                    log::warn!("key exchange with {:?} failed: {}", addr, err);
+                    return Ok(());
+                }
+            };
+            sink = Some(Sink::TcpStream(a, cipher.clone()));
+            // A peer that ignored the opening message already sent its first one; process that
+            // before waiting for more.
+            let mut first = first_message;
+            loop {
+                let mut bytes = match first.take() {
+                    Some(bytes) => bytes,
+                    None => match timeout(30_000, b.next()).await {
+                        Ok(Some(Ok(bytes))) => bytes,
+                        _ => break,
+                    },
+                };
+                if let Err(err) = crate::kx::unseal(&cipher, &mut bytes) {
+                    log::warn!("cannot decrypt from {:?}: {}", addr, err);
+                    break;
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1322,7 +1362,7 @@ impl RendezvousServer {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
-                        &hbb_common::message_proto::IdPk {
+                        &IdPk {
                             id,
                             pk,
                             ..Default::default()
