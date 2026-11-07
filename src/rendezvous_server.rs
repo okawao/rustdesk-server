@@ -672,10 +672,18 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
-                    self.register_tcp_peer_addr(&rp.id, addr).await;
-                    self.register_channel(&rp.id, sink).await;
+                    // Only the connection that registered this id, which the uuid and pk were
+                    // checked on, may refresh it: an id on its own is public. Anyone else is
+                    // asked for its pk, and the register_pk that follows is checked as usual.
+                    let own = self.channel_owned(&rp.id, sink).await;
+                    if own {
+                        self.register_tcp_peer_addr(&rp.id, addr).await;
+                    }
                     let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_peer_response(RegisterPeerResponse::default());
+                    msg_out.set_register_peer_response(RegisterPeerResponse {
+                        request_pk: !own,
+                        ..Default::default()
+                    });
                     Self::send_to_sink(sink, msg_out).await;
                     return true;
                 }
@@ -1036,12 +1044,26 @@ impl RendezvousServer {
         }
     }
 
+    /// Whether this connection is the one the id was registered on.
+    #[inline]
+    async fn channel_owned(&self, id: &str, sink: &SinkRef) -> bool {
+        self.channels
+            .lock()
+            .await
+            .get(id)
+            .map(|s| Arc::ptr_eq(s, sink))
+            .unwrap_or(false)
+    }
+
     #[inline]
     async fn register_channel(&self, id: &str, sink: &SinkRef) {
         if id.is_empty() || id.len() > MAX_PEER_ID_LEN {
             return;
         }
         let mut channels = self.channels.lock().await;
+        if channels.get(id).is_some_and(|s| Arc::ptr_eq(s, sink)) {
+            return;
+        }
         // One id per connection: a peer that registers under another name must not leave the old
         // entry behind, and no connection can grow the map.
         channels.retain(|_, s| !Arc::ptr_eq(s, sink));
