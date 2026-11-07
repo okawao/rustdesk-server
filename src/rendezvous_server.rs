@@ -55,6 +55,9 @@ enum Sink {
     TcpStream(TcpStreamSink, Option<StreamCipher>),
     Ws(WsSink),
 }
+/// A connection's write half, shared between the loop that reads the connection and whatever writes
+/// to the peer it belongs to.
+type SinkRef = Arc<Mutex<Sink>>;
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
@@ -141,7 +144,11 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, SinkRef>>>,
+    /// The connection each peer registered on, by id. A peer that registered over TCP or ws has
+    /// only that connection: the address a UDP datagram would go to is a connection's, and nothing
+    /// listens there.
+    channels: Arc<Mutex<HashMap<String, SinkRef>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -197,6 +204,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -572,7 +580,7 @@ impl RendezvousServer {
     async fn handle_tcp(
         &mut self,
         bytes: &[u8],
-        sink: &mut Option<Sink>,
+        sink: &SinkRef,
         addr: SocketAddr,
         key: &str,
         ws: bool,
@@ -580,10 +588,10 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), sink.clone());
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
                 }
@@ -595,16 +603,19 @@ impl RendezvousServer {
                         );
                         return false;
                     }
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), sink.clone());
+                    let id = rf.id.clone();
+                    if let Some(peer) = self.pm.get_in_memory(&id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        if !self.send_to_channel(&id, &msg_out).await {
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
@@ -637,9 +648,13 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    // A peer with only one connection answers a punch on it, and an answer is not
+                    // a reason to hang up.
+                    return true;
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
@@ -656,7 +671,20 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    self.register_tcp_peer_addr(&rp.id, addr).await;
+                    self.register_channel(&rp.id, sink).await;
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_register_peer_response(RegisterPeerResponse::default());
+                    Self::send_to_sink(sink, msg_out).await;
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // The registration a peer that cannot use UDP has: it is what makes the peer
+                    // reachable, since what is aimed at it is delivered on this connection.
+                    if !self.register_tcp_peer(&rk, addr, sink).await {
+                        log::trace!("Reject tcp registration of {:?} from {:?}", rk.id, addr);
+                    }
                     let res = register_pk_response::Result::NOT_SUPPORT;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -672,6 +700,59 @@ impl RendezvousServer {
             }
         }
         false
+    }
+
+    /// Records a peer that registered over TCP or ws, the way the UDP `RegisterPk` records one that
+    /// has a socket: the entry exists so a punch aimed at the peer finds it, and the same uuid/pk
+    /// rule decides whether the registration is accepted.
+    async fn register_tcp_peer(
+        &mut self,
+        rk: &RegisterPk,
+        addr: SocketAddr,
+        sink: &SinkRef,
+    ) -> bool {
+        if rk.id.len() < 6
+            || rk.id.len() > MAX_PEER_ID_LEN
+            || rk.uuid.is_empty()
+            || rk.pk.is_empty()
+        {
+            return false;
+        }
+        let ip = addr.ip().to_string();
+        let known = self.pm.get_in_memory(&rk.id).await.is_some();
+        // Only a new id grows the map, and the blocker the UDP path applies is what caps new ones
+        // per address; a peer that is already known is never throttled here.
+        if !known && !self.check_ip_blocker(&ip, &rk.id).await {
+            return false;
+        }
+        let peer = self.pm.get_or(&rk.id).await;
+        {
+            let mut peer = peer.write().await;
+            if !peer.uuid.is_empty() {
+                if peer.uuid != rk.uuid {
+                    return false;
+                }
+                if peer.info.ip != ip && peer.pk != rk.pk {
+                    return false;
+                }
+            }
+            peer.uuid = rk.uuid.clone();
+            peer.pk = rk.pk.clone();
+            peer.socket_addr = addr;
+            peer.last_reg_time = Instant::now();
+            peer.info.ip = ip;
+        }
+        self.register_channel(&rk.id, sink).await;
+        true
+    }
+
+    #[inline]
+    async fn register_tcp_peer_addr(&mut self, id: &str, addr: SocketAddr) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            let mut peer = peer.write().await;
+            peer.socket_addr = addr;
+            peer.last_reg_time = Instant::now();
+        }
     }
 
     #[inline]
@@ -918,26 +999,53 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        let tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
+            if let Some(sink) = tcp {
+                Self::send_to_sink(&sink, msg).await;
+            }
         });
     }
 
     #[inline]
-    async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
-        if let Some(sink) = sink.as_mut() {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s, cipher) => {
-                        allow_err!(s.send(Bytes::from(crate::kx::seal(cipher, bytes))).await);
-                    }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
-                    }
+    async fn send_to_sink(sink: &SinkRef, msg: RendezvousMessage) {
+        if let Ok(bytes) = msg.write_to_bytes() {
+            let mut sink = sink.lock().await;
+            match &mut *sink {
+                Sink::TcpStream(s, cipher) => {
+                    allow_err!(s.send(Bytes::from(crate::kx::seal(cipher, bytes))).await);
+                }
+                Sink::Ws(ws) => {
+                    allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
                 }
             }
         }
+    }
+
+    /// Writes to the connection a peer registered on. False when it has none, which is every peer
+    /// that registered over UDP: for those the datagram to their address is the way in.
+    #[inline]
+    async fn send_to_channel(&self, id: &str, msg: &RendezvousMessage) -> bool {
+        let sink = self.channels.lock().await.get(id).cloned();
+        match sink {
+            Some(sink) => {
+                Self::send_to_sink(&sink, msg.clone()).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[inline]
+    async fn register_channel(&self, id: &str, sink: &SinkRef) {
+        if id.is_empty() || id.len() > MAX_PEER_ID_LEN {
+            return;
+        }
+        let mut channels = self.channels.lock().await;
+        // One id per connection: a peer that registers under another name must not leave the old
+        // entry behind, and no connection can grow the map.
+        channels.retain(|_, s| !Arc::ptr_eq(s, sink));
+        channels.insert(id.to_owned(), sink.clone());
     }
 
     #[inline]
@@ -946,8 +1054,10 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
+        let sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        if let Some(sink) = sink {
+            Self::send_to_sink(&sink, msg).await;
+        }
         Ok(())
     }
 
@@ -959,9 +1069,12 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+            if !self.send_to_channel(&id, &msg).await {
+                self.tx.send(Data::Msg(msg.into(), addr))?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1262,7 +1375,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let mut sink;
+        let sink: SinkRef;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1298,10 +1411,10 @@ impl RendezvousServer {
             )
             .await??;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
+            sink = Arc::new(Mutex::new(Sink::Ws(a)));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &sink, addr, key, ws).await {
                         break;
                     }
                 }
@@ -1328,7 +1441,7 @@ impl RendezvousServer {
                     return Ok(());
                 }
             };
-            sink = Some(Sink::TcpStream(a, cipher.clone()));
+            sink = Arc::new(Mutex::new(Sink::TcpStream(a, cipher.clone())));
             // A peer that ignored the opening message already sent its first one; process that
             // before waiting for more.
             let mut first = first_message;
@@ -1344,14 +1457,16 @@ impl RendezvousServer {
                     log::warn!("cannot decrypt from {:?}: {}", addr, err);
                     break;
                 }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &sink, addr, key, ws).await {
                     break;
                 }
             }
         }
-        if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        }
+        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        self.channels
+            .lock()
+            .await
+            .retain(|_, s| !Arc::ptr_eq(s, &sink));
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
     }
