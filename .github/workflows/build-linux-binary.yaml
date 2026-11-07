@@ -9,6 +9,10 @@ on:
   push:
     paths:
       - .github/workflows/build-linux-binary.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - libs/hbb_common
+      - src/**
 
 permissions:
   contents: read

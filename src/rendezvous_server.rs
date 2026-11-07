@@ -664,6 +664,9 @@ impl RendezvousServer {
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
+                    // The client registers again on this same connection every REG_INTERVAL and
+                    // reads the error as not ready until it gets an answer.
+                    return true;
                 }
                 _ => {}
             }
