@@ -533,6 +533,26 @@ impl RendezvousServer {
                     // UDP PunchHoleRequest is intentionally unsupported.
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
+                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                    // The only thing that tells a controller which port its punching socket is
+                    // mapped to: `test_udp_uat` takes it from this answer, and with none the port
+                    // stays 0, no `udp_port` goes out in the punch request, and every peer punches
+                    // over TCP instead. `addr` is this datagram's source, so `addr.port()` is that
+                    // socket's public port.
+                    let mut msg_out = RendezvousMessage::new();
+                    let mut res = TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    };
+                    if self.inner.serial > tar.serial {
+                        let mut cu = ConfigUpdate::new();
+                        cu.serial = self.inner.serial;
+                        cu.rendezvous_servers = (*self.rendezvous_servers).clone();
+                        res.cu = MessageField::from_option(Some(cu));
+                    }
+                    msg_out.set_test_nat_response(res);
+                    socket.send(&msg_out, addr).await?
+                }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     // A controller's punch is dialled at the address this server *observed* for the
                     // punching peer, and only a datagram carries that peer's UDP mapping - the TCP
