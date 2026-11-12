@@ -946,12 +946,11 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
-                if peer_is_lan {
-                    // https://github.com/rustdesk/rustdesk-server/issues/24
-                    relay_server = self.inner.local_ip.clone()
-                }
-                ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+            let server_relays =
+                ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan);
+            if server_relays && peer_is_lan {
+                // https://github.com/rustdesk/rustdesk-server/issues/24
+                relay_server = self.inner.local_ip.clone()
             }
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
@@ -985,6 +984,12 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // A relay-only decision travels as `force_relay` rather than as a rewritten
+                    // `nat_type`: clients act on the nat type themselves, and squashing it into
+                    // "symmetric" is what made every such peer relay before trying to punch. This
+                    // carries the server's own reasons (ALWAYS_USE_RELAY, a v4 LAN/public
+                    // mismatch) and the controller's request for one, which used to be dropped.
+                    force_relay: server_relays || ph.force_relay,
                     // Without this the peer is told `udp_port = 0` and punches over TCP, because
                     // that is what the field means on the receiving side: no UDP socket was
                     // announced, so there is no UDP address to punch towards. Dropping it here is
