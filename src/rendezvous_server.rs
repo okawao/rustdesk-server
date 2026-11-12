@@ -534,7 +534,25 @@ impl RendezvousServer {
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    // A controller's punch is dialled at the address this server *observed* for the
+                    // punching peer, and only a datagram carries that peer's UDP mapping - the TCP
+                    // channel it registers on has a different source port, and a punch probe aimed
+                    // there goes nowhere. So the accept below is what makes a direct UDP connection
+                    // possible at all; without it every peer falls back to the TCP punch or the relay.
+                    // This reopens what an earlier commit closed against UDP reflection, and it is
+                    // not one: the answer is delivered on the request connection the controller
+                    // opened, looked up by the address it asked to be answered at, so a datagram
+                    // cannot make this server talk at a third party. It is also limited to peers that
+                    // are registered and still in memory. To close it again, restore the empty arm.
+                    if self.pm.get_in_memory(&phs.id).await.is_some() {
+                        allow_err!(self.handle_hole_sent(phs, addr, true).await);
+                    } else {
+                        log::debug!(
+                            "drop UDP PunchHoleSent for unregistered peer {:?} from {:?}",
+                            phs.id,
+                            addr
+                        );
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
@@ -647,7 +665,7 @@ impl RendezvousServer {
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    allow_err!(self.handle_hole_sent(phs, addr, false).await);
                     // A peer with only one connection answers a punch on it, and an answer is not
                     // a reason to hang up.
                     return true;
@@ -808,17 +826,17 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn handle_hole_sent<'a>(
+    async fn handle_hole_sent(
         &mut self,
         phs: PunchHoleSent,
         addr: SocketAddr,
-        socket: Option<&'a mut FramedSocket>,
+        udp: bool,
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
-            if socket.is_none() { "TCP" } else { "UDP" },
+            if udp { "UDP" } else { "TCP" },
             &addr_a,
             &addr
         );
@@ -827,17 +845,22 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            // Whether this peer's punching socket is at `socket_addr` at all. The controller keeps
+            // that address for its TCP punch and dials it with UDP only when this says so, because
+            // a `PunchHoleSent` that arrived over TCP was sent from the registering connection,
+            // whose source port is not the punching socket's.
+            is_udp: udp,
+            socket_addr_list: phs.socket_addr_list.clone(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
             p.set_nat_type(t);
         }
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
-        } else {
-            self.send_to_tcp(msg_out, addr_a).await;
-        }
+        // The answer goes back over TCP in both cases: it is read off the connection the controller
+        // opened for its request, and a UDP arrival only means the punching socket is how this
+        // peer's address was observed, not where the answer can be delivered.
+        self.send_to_tcp(msg_out, addr_a).await;
         Ok(())
     }
 
@@ -962,6 +985,11 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // Without this the peer is told `udp_port = 0` and punches over TCP, because
+                    // that is what the field means on the receiving side: no UDP socket was
+                    // announced, so there is no UDP address to punch towards. Dropping it here is
+                    // what makes a server TCP-punch-only.
+                    udp_port: ph.udp_port,
                     ..Default::default()
                 });
             }
