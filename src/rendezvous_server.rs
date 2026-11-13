@@ -1015,6 +1015,10 @@ impl RendezvousServer {
                     // announced, so there is no UDP address to punch towards. Dropping it here is
                     // what makes a server TCP-punch-only.
                     udp_port: ph.udp_port,
+                    // The caller's own punching addresses. The peer is told the one this server
+                    // observed for it, which is the wrong one as soon as that machine has more
+                    // than one, and this is the only field that carries the rest.
+                    socket_addr_list: ph.socket_addr_list,
                     ..Default::default()
                 });
             }
